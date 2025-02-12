@@ -15,6 +15,25 @@ SELECT+Name+FROM+Merchandise__c+WHERE+CreatedDate+=+TODAY+AND+Price__c+>+10.0`
 
 
 ## How It Works
+```mermaid
+flowchart TD
+    A((Start)) -->C
+    C{{ Explain elements of...}}
+    C -->|ListViews or Reports| D[**SF REST Query** <br /> those viewed or ran<br />  last month]
+    C -->|SOQLs| E[Get Queries from <br /> prepared file]
+    D-->F[Download Artifacts from previous run]
+    E-->F
+    F-->G([On each element...])
+    G-->H[Run  **SF REST Query Explain** <br />⟲]
+    H-->I[Append JSON result to Artifact<br />⟲]
+     
+    I-->J([...until last...])
+    J-->|Loop|G
+    J --> K[Upload updated Artifact]
+    
+    K-->P((End))
+```
+
 1. **Trigger on Pull Request**: By default, the workflow executes when a PR is opened or updated.
 2. **Retrieve List Views and Reports**: Using REST API, retrieves list of List Views and Reports that were used last month, to pass them into Explain endpoint.
 3. **Query Plan Extraction**:
