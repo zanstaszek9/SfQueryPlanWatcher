@@ -1,0 +1,139 @@
+name: Measure Database Performance with Query Plan
+
+on:
+  pull_request:
+    branches:
+      - main
+    types: [ opened, synchronize ]
+    paths:
+      - 'main/**'
+
+jobs:
+  measure-costs:
+    runs-on: ubuntu-latest
+    container:
+      image: salesforce/cli:latest-slim
+    strategy:
+      fail-fast: false
+      matrix:
+        entity: [ ListView, Report, Query, QueryInFlow ]
+        include:
+          - entity: ListView
+            query: "SELECT Id, DeveloperName, SobjectType, CreatedDate, LastViewedDate, Name FROM ListView WHERE LastViewedDate >= LAST_MONTH ORDER BY CreatedDate"
+          - entity: Report
+            query: "SELECT Id, DeveloperName, Name, FolderName, CreatedDate, LastViewedDate, LastRunDate FROM Report WHERE LastRunDate >= LAST_MONTH ORDER BY CreatedDate"
+          - entity: Query
+            path: "./queryPlanExplains/soqlsToExplain.csv"
+          - entity: QueryInFlow
+            path: "./queryPlanExplains/queriesFromFlowsToExplain.csv"
+
+    steps:
+      - name: 'Checkout source code'
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: 'Authenticate using SFDX_AUTH_URL'
+        run: |
+          echo ${{ secrets.SFDX_AUTH_URL }} | sf org login sfdx-url -s -u
+
+      - name: Get last Workflow ID
+        env:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          workflows=$(curl -L \
+          -H "Accept: application/vnd.github+json" \
+          -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+          -H "X-GitHub-Api-Version: 2022-11-28" \
+          https://api.github.com/repos/${{ github.repository_owner }}/${{ github.event.repository.name }}/actions/runs?per_page=5&page=1&status=completed)
+          
+          latest_workflow=$(echo "$workflows" | jq -c '
+          .workflow_runs
+          | map(select(.status == "completed"))  
+          | group_by(.name)
+          | map(sort_by(.created_at) | last)  
+          | map({name, id})')
+          
+          current_workflow="${{ github.workflow }}"
+          
+          echo "$latest_workflow" | jq -c '.[]' | while read -r workflow; do
+            name=$(echo "$workflow" | jq -r '.name')
+            id=$(echo "$workflow" | jq -r '.id')
+          
+            trimmed_name=$(echo "$name" | xargs)
+            trimmed_current_workflow=$(echo "$current_workflow" | xargs)
+          
+            if [ "$trimmed_name" = "$trimmed_current_workflow" ]; then
+              echo "LAST_WORKFLOW_RUN=$id" >> $GITHUB_ENV
+            fi
+          done
+          
+          echo "Last workflow run: ${{ env.LAST_WORKFLOW_RUN }}"
+        continue-on-error: true
+
+      - name: 'Download previous result files,  explain${{ matrix.entity }}s.json if available'
+        uses: actions/download-artifact@v4
+        with:
+          name: 'explain${{ matrix.entity }}sJson'
+          path: .
+          run-id: ${{ env.LAST_WORKFLOW_RUN }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+        continue-on-error: true
+
+      - name: 'Initialize files that stores results, if not exists - explain${{ matrix.entity }}s.json'
+        run: |
+          if [ ! -f explain${{ matrix.entity }}s.json ]; then
+            echo "[]" > explain${{ matrix.entity }}s.json
+          fi
+
+      - name: "Fetch ${{ matrix.entity }} data"
+        run: |
+          case ${{ matrix.entity }} in
+            Report | ListView)
+              sf api request rest "services/data/v61.0/query?q=${{ matrix.query }}" --stream-to-file ./queried${{ matrix.entity }}s.json
+            ;;
+            Query | QueryInFlow)
+            cp ${{ matrix.path }} ./queried${{ matrix.entity }}s.json
+            ;;
+          esac
+
+
+      - name: "Process ${{ matrix.entity }} data and fetch explain plans"
+        run: |
+          execution_time=$(date -u +"%Y-%m-%dT%H:%M:%S.%3N")
+          final_json=$(cat explain${{ matrix.entity }}s.json)
+          
+          case ${{ matrix.entity }} in
+            Report | ListView)
+              jq -c '.records[]' ./queried${{ matrix.entity }}s.json | while read -r record; do
+                id=$(echo "$record" | jq -r '.Id')
+                echo "Processing record ID: $id"
+          
+                explain_json=$(sf api request rest "services/data/v61.0/query/?explain=$id")
+                merged_json=$(echo "$record" | jq --argjson explain "$explain_json" --arg exec_time "$execution_time" '. + {plans: $explain.plans, sourceQuery: $explain.sourceQuery, ExplainExecutionTime: $exec_time, ExplainEntity: "${{ matrix.entity }}"}')
+                final_json=$(echo "$final_json" | jq --argjson merged "$merged_json" '. + [$merged]')
+                echo "$final_json" > explain${{ matrix.entity }}s.json
+              done
+            ;;
+            Query | QueryInFlow)
+              echo "1 Processing Query: $query"
+              echo File with queries
+              cat ./queried${{ matrix.entity }}s.json
+              cat ./queried${{ matrix.entity }}s.json | while read -r query; do
+                echo "Processing Query: $query"
+          
+                explain_json=$(sf api request rest "services/data/v61.0/query/?explain=$query")
+                merged_json=$(jq -n --arg query "$query" --argjson explain "$explain_json" --arg exec_time "$execution_time" '{sourceQuery: $query, plans: $explain.plans, ExplainExecutionTime: $exec_time, ExplainEntity: "${{ matrix.entity }}"}')
+                final_json=$(echo "$final_json" | jq --argjson merged "$merged_json" '. + [$merged]')
+                echo "$final_json" > explain${{ matrix.entity }}s.json
+              done
+            ;;
+          esac
+
+      -   name: 'Save Explain JSON Artifact'
+          uses: actions/upload-artifact@v4
+          with:
+            name: 'explain${{ matrix.entity }}sJson'
+            path: explain${{ matrix.entity }}s.json
+
+

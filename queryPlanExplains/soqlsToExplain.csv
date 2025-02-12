@@ -1,0 +1,2 @@
+SELECT Id FROM Opportunity WHERE Amount > 10000
+SELECT Id FROM Case WHERE CreatedDate = LAST_WEEK

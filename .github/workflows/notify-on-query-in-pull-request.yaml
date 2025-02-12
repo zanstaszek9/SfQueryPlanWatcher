@@ -1,0 +1,173 @@
+name: Notify if Database Query in Pull Request
+
+on:
+  pull_request:
+    branches:
+      - main
+    types: [ opened, synchronize ]
+    paths:
+      - 'main/**'
+
+jobs:
+  scan-apex-for-queries:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: 'Checkout source code'
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+
+      - name: 'Find SELECT queries in Apex files'
+        run: |
+          FILES=$(git diff --name-only --diff-filter=ACM HEAD^ | grep '\.cls$' | grep -Evi '(Test|Tst)\.cls$' || true)
+          COMMENT_BODY="⚠️ **Potential Query Found**"
+          
+          EXISTING_COMMENTS=$(curl -s -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+          -H "Accept: application/vnd.github.v3+json" \
+          "https://api.github.com/repos/${{ github.repository }}/pulls/${{ github.event.number }}/comments")
+  
+          for file in $FILES; do
+            if grep -qi "@IsTest" "$file"; then
+              echo "Skipping test file: $file"
+              continue
+            fi
+  
+            grep -niE "SELECT|query" "$file" | while IFS=: read -r line match; do
+  
+              if echo "$EXISTING_COMMENTS" | jq -e ".[] | select(.path == \"$file\" and .line == $line) | .body" | grep -q "$COMMENT_BODY"; then
+                echo "Skipping existing comment at $file:$line"
+                continue
+              fi
+  
+  
+              # Create a new comment JSON
+              COMMENT_JSON=$(jq -n --arg file "$file" --argjson line "$line" --arg body "$COMMENT_BODY" --arg commit_id "${{ github.event.after }}" '{
+                  body: $body,
+                  path: $file,
+                  line: $line,
+                  commit_id: $commit_id,
+                  side: "RIGHT"
+              }')
+  
+              # Post the comment to the PR
+              curl -s -X POST -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+                -H "Accept: application/vnd.github.v3+json" \
+                "https://api.github.com/repos/${{ github.repository }}/pulls/${{ github.event.number }}/comments" \
+                -d "$COMMENT_JSON"
+            done
+          done
+
+  
+
+  scan-flows-for-queries:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Install xmllint
+        run: sudo apt-get install -y libxml2-utils
+
+      - name: 'Checkout source code'
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+
+      - name: 'Find Potential Queries in Flow'
+        id: check-queries
+        run: |         
+          FILES=$(git diff --name-only --diff-filter=ACM HEAD^ | grep '\.flow-meta.xml$' || true)
+          FILE_LINE_NUMBERS=()
+
+
+          for FILE in $FILES; do
+            echo "🔍 Processing file: $FILE"
+          
+          
+            FLOW_ELEMENTS_WITH_DATABASE_QUERY=$(xmllint --xpath \
+                                              "(//*[local-name()='recordLookups'] | \
+                                                 //*[local-name()='recordUpdates' and not(.//*[local-name()='inputReference'])] | \
+                                                 //*[local-name()='recordDeletes' and not(.//*[local-name()='inputReference'])]) \
+                                              /*[local-name()='name']" \
+                                              "$FILE" 2>/dev/null || echo "")        
+          
+          
+            if [ -z "$FLOW_ELEMENTS_WITH_DATABASE_QUERY" ]; then
+              echo "⚠️ No matching tags found in $FILE, skipping..."
+              continue
+            fi
+          
+            LINE_NUMBERS=()
+          
+          
+            if [[ -n "$FLOW_ELEMENTS_WITH_DATABASE_QUERY" ]]; then
+            #### Using 'while-loop' with here-string and IFS=, as for-loop did not match the elements due to string parsing           
+                while IFS= read -r element; do
+                    line_number=$(grep -nF "$element" "$FILE" | cut -d: -f1)
+          
+                    if [[ -n "$line_number" ]]; then
+                        LINE_NUMBERS+=("$line_number")
+                    fi
+                done <<< "$FLOW_ELEMENTS_WITH_DATABASE_QUERY"
+            fi
+          
+            FILE_LINE_NUMBERS+=("$FILE:${LINE_NUMBERS[*]}")
+          
+          done
+          
+          if [-z "$FILE_LINE_NUMBERS"]; then  
+              echo "⚠️⚠️ No Flows with queries found in this PR, returning..."
+              return
+          fi
+          
+          POTENTIAL_QUERY_COMMENT_BODY="🚩 Potential Query in Flow found"
+          
+          EXISTING_COMMENTS=$(curl -s -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+            -H "Accept: application/vnd.github.v3+json" \
+            "https://api.github.com/repos/${{ github.repository }}/pulls/${{ github.event.number }}/comments")
+          echo "🧐 Fetched existing comments."
+          
+          
+          NEW_COMMENTS_TO_CREATE=()
+          for entry in "${FILE_LINE_NUMBERS[@]}"; do
+              file_path="${entry%%:*}"  # Extract file path
+              line_numbers="${entry#*:}"  # Extract line numbers
+
+
+              # Convert line numbers to an array
+              IFS=' ' read -r -a line_numbers_array <<< "$line_numbers"
+
+              # Fetch existing comments for the current file
+              EXISTING_COMMENTS_FOR_FILE=$(echo "$EXISTING_COMMENTS" | jq -c --arg file "$file_path" '.[] | select(.path == $file)')
+
+              # Iterate through each line number
+              for line_number in "${line_numbers_array[@]}"; do
+                  echo "🔎 Checking line number: $line_number"
+
+                  COMMENT_EXISTS=$(echo "$EXISTING_COMMENTS_FOR_FILE" | jq --arg body "$POTENTIAL_QUERY_COMMENT_BODY" --argjson line "$line_number" 'select(.body == $body and .line == $line)')
+
+                  if [ -z "$COMMENT_EXISTS" ]; then
+                      echo "➕ No existing comment found for line $line_number. Creating a new comment..."
+
+                      # Create a new comment JSON
+                      COMMENT_JSON=$(jq -n --arg file "$file_path" --argjson line "$line_number" --arg body "$POTENTIAL_QUERY_COMMENT_BODY" --arg commit_id "${{ github.event.after }}" '{
+                          body: $body,
+                          path: $file,
+                          line: $line,
+                          commit_id: $commit_id,
+                          side: "RIGHT"
+                      }')
+          
+                      # Post the comments to the PR
+                      curl -s -X POST -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+                        -H "Accept: application/vnd.github.v3+json" \
+                        "https://api.github.com/repos/${{ github.repository }}/pulls/${{ github.event.number }}/comments" \
+                        -d "$COMMENT_JSON"
+                      echo "✅ No existing comment found for line $line_number. Creating a new comment..."
+                  else
+                      echo "⏩ Comment already exists for line $line_number. Skipping..."
+                  fi
+              done
+          done
+

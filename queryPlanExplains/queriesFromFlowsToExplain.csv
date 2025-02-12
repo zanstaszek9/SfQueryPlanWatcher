@@ -1,0 +1,5 @@
+SELECT Id FROM Account
+SELECT Id FROM Account WHERE Rating = 'Hot'
+SELECT Id FROM Lead WHERE Company = 'Acme'
+SELECT Id FROM Lead WHERE NumberOfEmployees > 50
+SELECT Id FROM Contact WHERE CreatedDate < LAST_WEEK AND CreatedDate >= LAST_MONTH
